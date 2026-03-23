@@ -1175,7 +1175,23 @@ def main() -> None:
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+        # Train a zstd dictionary on chunk-samples from each quantized weight tensor.
+        # The dictionary pre-seeds the match table with cross-layer patterns so every
+        # layer's data benefits from them, even the first bytes of the stream.
+        _ZSTD_DICT_SIZE = 65536  # 64 KB; tune vs. compression savings
+        _ZSTD_CHUNK = 512
+        _dict_samples = []
+        for _t in quant_result.values():
+            _raw = _t.numpy().tobytes()
+            for _i in range(0, len(_raw) - _ZSTD_CHUNK, _ZSTD_CHUNK):
+                _dict_samples.append(_raw[_i : _i + _ZSTD_CHUNK])
+        _dict_bytes = zstandard.train_dictionary(_ZSTD_DICT_SIZE, _dict_samples).as_bytes()
+        _zdict = zstandard.ZstdCompressionDict(_dict_bytes)
+        _compressed = zstandard.ZstdCompressor(level=22, dict_data=_zdict).compress(quant_raw)
+        # Artifact layout: [4B dict_len][dict_bytes][compressed_weights]
+        quant_blob = len(_dict_bytes).to_bytes(4, "little") + _dict_bytes + _compressed
+        log0(f"zstd_dict: dict={len(_dict_bytes)}B raw={len(quant_raw)}B "
+             f"compressed={len(_compressed)}B total_artifact={len(quant_blob)}B")
     else:
         quant_blob = zlib.compress(quant_raw, 9)
     if master_process:
@@ -1191,7 +1207,11 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     if _COMPRESSOR == "zstd":
-        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
+        _dict_len = int.from_bytes(quant_blob_disk[:4], "little")
+        _zdict = zstandard.ZstdCompressionDict(quant_blob_disk[4 : 4 + _dict_len])
+        decompressed = zstandard.ZstdDecompressor(dict_data=_zdict).decompress(
+            quant_blob_disk[4 + _dict_len :]
+        )
     else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
